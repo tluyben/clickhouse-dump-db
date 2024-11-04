@@ -1,10 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -19,12 +19,11 @@ import (
 type TableSchema struct {
 	Name    string   `json:"name"`
 	Schema  string   `json:"schema"`
-	Data    [][]any  `json:"data"`
 	Columns []string `json:"columns"`
 	Types   []string `json:"types"`
 }
 
-type DatabaseDump struct {
+type DatabaseMetadata struct {
 	Tables []TableSchema `json:"tables"`
 }
 
@@ -168,6 +167,20 @@ func getScanType(typ string) any {
 	}
 }
 
+func writeRowToFile(file *os.File, row []any) error {
+	data, err := json.Marshal(row)
+	if err != nil {
+		return err
+	}
+	_, err = file.Write(append(data, '\n'))
+	return err
+}
+
+const (
+	batchSize       = 10000 // Number of rows to process in memory at once
+	restoreBatchSize = 1000 // Number of rows to batch insert during restore
+)
+
 func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, filePath string) error {
 	exists, err := databaseExists(ctx, conn, database)
 	if err != nil {
@@ -177,6 +190,12 @@ func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, fi
 		return fmt.Errorf("database %s does not exist", database)
 	}
 
+	// Create dump directory
+	dumpDir := filePath
+	if err := os.MkdirAll(dumpDir, 0755); err != nil {
+		return err
+	}
+
 	// Get all tables
 	rows, err := conn.Query(ctx, fmt.Sprintf("SHOW TABLES FROM %s", database))
 	if err != nil {
@@ -184,7 +203,7 @@ func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, fi
 	}
 	defer rows.Close()
 
-	dump := DatabaseDump{}
+	metadata := DatabaseMetadata{}
 	var tableName string
 	for rows.Next() {
 		if err := rows.Scan(&tableName); err != nil {
@@ -203,28 +222,71 @@ func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, fi
 		if err != nil {
 			return err
 		}
-		defer colRows.Close()
 
 		var columns []string
 		var types []string
 		for colRows.Next() {
 			var name, typ string
 			if err := colRows.Scan(&name, &typ); err != nil {
+				colRows.Close()
 				return err
 			}
 			columns = append(columns, name)
 			types = append(types, typ)
 		}
+		colRows.Close()
 
-		// Get table data
+		tableSchema := TableSchema{
+			Name:    tableName,
+			Schema:  schema,
+			Columns: columns,
+			Types:   types,
+		}
+		metadata.Tables = append(metadata.Tables, tableSchema)
+
+		// Create table directory
+		tableDir := filepath.Join(dumpDir, tableName)
+		if err := os.MkdirAll(tableDir, 0755); err != nil {
+			return err
+		}
+
+		// Write table schema
+		schemaFile := filepath.Join(tableDir, "schema.json")
+		schemaData, err := json.MarshalIndent(tableSchema, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(schemaFile, schemaData, 0644); err != nil {
+			return err
+		}
+
+		// Get table data in batches
 		dataRows, err := conn.Query(ctx, fmt.Sprintf("SELECT * FROM %s.%s", database, tableName))
 		if err != nil {
 			return err
 		}
-		defer dataRows.Close()
 
-		var tableData [][]any
+		var currentBatch int
+		var rowCount int
+		var currentFile *os.File
+
 		for dataRows.Next() {
+			if rowCount%batchSize == 0 {
+				// Close previous file if exists
+				if currentFile != nil {
+					currentFile.Close()
+				}
+
+				// Create new file for next batch
+				currentBatch = rowCount / batchSize
+				dataFile := filepath.Join(tableDir, fmt.Sprintf("data_%d.json", currentBatch))
+				currentFile, err = os.Create(dataFile)
+				if err != nil {
+					dataRows.Close()
+					return err
+				}
+			}
+
 			// Create properly typed scan targets based on column types
 			scanArgs := make([]any, len(types))
 			for i, typ := range types {
@@ -232,6 +294,8 @@ func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, fi
 			}
 
 			if err := dataRows.Scan(scanArgs...); err != nil {
+				currentFile.Close()
+				dataRows.Close()
 				return err
 			}
 
@@ -277,30 +341,31 @@ func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, fi
 					}
 				}
 			}
-			tableData = append(tableData, row)
+
+			if err := writeRowToFile(currentFile, row); err != nil {
+				currentFile.Close()
+				dataRows.Close()
+				return err
+			}
+
+			rowCount++
 		}
 
-		dump.Tables = append(dump.Tables, TableSchema{
-			Name:    tableName,
-			Schema:  schema,
-			Data:    tableData,
-			Columns: columns,
-			Types:   types,
-		})
+		if currentFile != nil {
+			currentFile.Close()
+		}
+		dataRows.Close()
+
+		log.Printf("Dumped table %s: %d rows", tableName, rowCount)
 	}
 
-	// Write to file
-	data, err := json.MarshalIndent(dump, "", "  ")
+	// Write database metadata
+	metadataFile := filepath.Join(dumpDir, "metadata.json")
+	metadataData, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
 		return err
 	}
-
-	dir := filepath.Dir(filePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	return ioutil.WriteFile(filePath, data, 0644)
+	return os.WriteFile(metadataFile, metadataData, 0644)
 }
 
 func convertValue(val any, typ string) (any, error) {
@@ -350,15 +415,46 @@ func convertValue(val any, typ string) (any, error) {
 	}
 }
 
+func processDataFile(file *os.File, table TableSchema, batch interface{ Append(...any) error }, batchRows *int) error {
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024) // 10MB buffer size
+
+	for scanner.Scan() {
+		var row []any
+		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
+			return err
+		}
+
+		// Convert values to appropriate types for insertion
+		convertedRow := make([]any, len(row))
+		for i, val := range row {
+			converted, err := convertValue(val, table.Types[i])
+			if err != nil {
+				return fmt.Errorf("error converting value for column %s: %w", table.Columns[i], err)
+			}
+			convertedRow[i] = converted
+		}
+
+		if err := batch.Append(convertedRow...); err != nil {
+			return fmt.Errorf("error appending to batch: %w", err)
+		}
+
+		*batchRows++
+	}
+
+	return scanner.Err()
+}
+
 func restoreDatabase(ctx context.Context, conn clickhouse.Conn, database string, filePath string) error {
-	// Read dump file
-	data, err := ioutil.ReadFile(filePath)
+	// Read metadata file
+	metadataFile := filepath.Join(filePath, "metadata.json")
+	metadataData, err := os.ReadFile(metadataFile)
 	if err != nil {
 		return err
 	}
 
-	var dump DatabaseDump
-	if err := json.Unmarshal(data, &dump); err != nil {
+	var metadata DatabaseMetadata
+	if err := json.Unmarshal(metadataData, &metadata); err != nil {
 		return err
 	}
 
@@ -379,47 +475,60 @@ func restoreDatabase(ctx context.Context, conn clickhouse.Conn, database string,
 	}
 
 	// Restore tables
-	for _, table := range dump.Tables {
+	for _, table := range metadata.Tables {
 		// Create table
 		createSQL := strings.Replace(table.Schema, table.Name, fmt.Sprintf("%s.%s", database, table.Name), 1)
 		if err := conn.Exec(ctx, createSQL); err != nil {
 			return fmt.Errorf("error creating table %s: %w", table.Name, err)
 		}
 
-		// Insert data if any exists
-		if len(table.Data) > 0 {
-			placeholders := make([]string, len(table.Data[0]))
-			for i := range placeholders {
-				placeholders[i] = "?"
-			}
-			insertSQL := fmt.Sprintf("INSERT INTO %s.%s VALUES (%s)",
-				database, table.Name, strings.Join(placeholders, ","))
+		tableDir := filepath.Join(filePath, table.Name)
+		dataFiles, err := filepath.Glob(filepath.Join(tableDir, "data_*.json"))
+		if err != nil {
+			return err
+		}
 
-			batch, err := conn.PrepareBatch(ctx, insertSQL)
+		// Prepare insert statement
+		placeholders := make([]string, len(table.Columns))
+		for i := range placeholders {
+			placeholders[i] = "?"
+		}
+		insertSQL := fmt.Sprintf("INSERT INTO %s.%s VALUES (%s)",
+			database, table.Name, strings.Join(placeholders, ","))
+
+		var totalRows int
+		// Process each data file
+		for _, dataFile := range dataFiles {
+			file, err := os.Open(dataFile)
 			if err != nil {
 				return err
 			}
 
-			for _, row := range table.Data {
-				// Convert values to appropriate types for insertion
-				convertedRow := make([]any, len(row))
-				for i, val := range row {
-					converted, err := convertValue(val, table.Types[i])
-					if err != nil {
-						return fmt.Errorf("error converting value for column %s: %w", table.Columns[i], err)
-					}
-					convertedRow[i] = converted
-				}
+			batch, err := conn.PrepareBatch(ctx, insertSQL)
+			if err != nil {
+				file.Close()
+				return err
+			}
 
-				if err := batch.Append(convertedRow...); err != nil {
-					return fmt.Errorf("error inserting data into %s: %w", table.Name, err)
+			batchRows := 0
+			if err := processDataFile(file, table, batch, &batchRows); err != nil {
+				file.Close()
+				return fmt.Errorf("error processing data file %s: %w", dataFile, err)
+			}
+
+			// Send batch if we have any rows
+			if batchRows > 0 {
+				if err := batch.Send(); err != nil {
+					file.Close()
+					return fmt.Errorf("error sending batch: %w", err)
 				}
 			}
 
-			if err := batch.Send(); err != nil {
-				return fmt.Errorf("error sending batch for %s: %w", table.Name, err)
-			}
+			totalRows += batchRows
+			file.Close()
 		}
+
+		log.Printf("Restored table %s: processed %d rows", table.Name, totalRows)
 	}
 
 	return nil
