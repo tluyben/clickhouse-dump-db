@@ -17,9 +17,11 @@ import (
 )
 
 type TableSchema struct {
-	Name   string  `json:"name"`
-	Schema string  `json:"schema"`
-	Data   [][]any `json:"data"`
+	Name    string   `json:"name"`
+	Schema  string   `json:"schema"`
+	Data    [][]any  `json:"data"`
+	Columns []string `json:"columns"`
+	Types   []string `json:"types"`
 }
 
 type DatabaseDump struct {
@@ -112,6 +114,60 @@ func databaseExists(ctx context.Context, conn clickhouse.Conn, database string) 
 	return false, nil
 }
 
+func getScanType(typ string) any {
+	typeLower := strings.ToLower(typ)
+	switch {
+	case strings.Contains(typeLower, "int8"):
+		var v int8
+		return &v
+	case strings.Contains(typeLower, "int16"):
+		var v int16
+		return &v
+	case strings.Contains(typeLower, "int32"):
+		var v int32
+		return &v
+	case strings.Contains(typeLower, "int64"):
+		var v int64
+		return &v
+	case strings.Contains(typeLower, "uint8"):
+		var v uint8
+		return &v
+	case strings.Contains(typeLower, "uint16"):
+		var v uint16
+		return &v
+	case strings.Contains(typeLower, "uint32"):
+		var v uint32
+		return &v
+	case strings.Contains(typeLower, "uint64"):
+		var v uint64
+		return &v
+	case strings.Contains(typeLower, "float32"):
+		var v float32
+		return &v
+	case strings.Contains(typeLower, "float64"):
+		var v float64
+		return &v
+	case strings.Contains(typeLower, "decimal"):
+		var v float64
+		return &v
+	case strings.Contains(typeLower, "string"):
+		var v string
+		return &v
+	case strings.Contains(typeLower, "datetime"):
+		var v time.Time
+		return &v
+	case strings.Contains(typeLower, "date"):
+		var v time.Time
+		return &v
+	case strings.Contains(typeLower, "bool"):
+		var v bool
+		return &v
+	default:
+		var v any
+		return &v
+	}
+}
+
 func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, filePath string) error {
 	exists, err := databaseExists(ctx, conn, database)
 	if err != nil {
@@ -142,6 +198,24 @@ func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, fi
 			return err
 		}
 
+		// Get column information
+		colRows, err := conn.Query(ctx, fmt.Sprintf("SELECT name, type FROM system.columns WHERE database = '%s' AND table = '%s'", database, tableName))
+		if err != nil {
+			return err
+		}
+		defer colRows.Close()
+
+		var columns []string
+		var types []string
+		for colRows.Next() {
+			var name, typ string
+			if err := colRows.Scan(&name, &typ); err != nil {
+				return err
+			}
+			columns = append(columns, name)
+			types = append(types, typ)
+		}
+
 		// Get table data
 		dataRows, err := conn.Query(ctx, fmt.Sprintf("SELECT * FROM %s.%s", database, tableName))
 		if err != nil {
@@ -149,24 +223,69 @@ func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, fi
 		}
 		defer dataRows.Close()
 
-		columnTypes := dataRows.ColumnTypes()
 		var tableData [][]any
 		for dataRows.Next() {
-			values := make([]any, len(columnTypes))
-			scanArgs := make([]any, len(columnTypes))
-			for i := range values {
-				scanArgs[i] = &values[i]
+			// Create properly typed scan targets based on column types
+			scanArgs := make([]any, len(types))
+			for i, typ := range types {
+				scanArgs[i] = getScanType(typ)
 			}
+
 			if err := dataRows.Scan(scanArgs...); err != nil {
 				return err
 			}
-			tableData = append(tableData, values)
+
+			// Extract values and convert to appropriate format for JSON
+			row := make([]any, len(scanArgs))
+			for i, arg := range scanArgs {
+				switch v := arg.(type) {
+				case *time.Time:
+					if *v != (time.Time{}) {
+						row[i] = v.Format(time.RFC3339)
+					} else {
+						row[i] = nil
+					}
+				case *int8:
+					row[i] = *v
+				case *int16:
+					row[i] = *v
+				case *int32:
+					row[i] = *v
+				case *int64:
+					row[i] = *v
+				case *uint8:
+					row[i] = *v
+				case *uint16:
+					row[i] = *v
+				case *uint32:
+					row[i] = *v
+				case *uint64:
+					row[i] = *v
+				case *float32:
+					row[i] = *v
+				case *float64:
+					row[i] = *v
+				case *string:
+					row[i] = *v
+				case *bool:
+					row[i] = *v
+				default:
+					if v != nil {
+						row[i] = *v.(*any)
+					} else {
+						row[i] = nil
+					}
+				}
+			}
+			tableData = append(tableData, row)
 		}
 
 		dump.Tables = append(dump.Tables, TableSchema{
-			Name:   tableName,
-			Schema: schema,
-			Data:   tableData,
+			Name:    tableName,
+			Schema:  schema,
+			Data:    tableData,
+			Columns: columns,
+			Types:   types,
 		})
 	}
 
@@ -182,6 +301,53 @@ func dumpDatabase(ctx context.Context, conn clickhouse.Conn, database string, fi
 	}
 
 	return ioutil.WriteFile(filePath, data, 0644)
+}
+
+func convertValue(val any, typ string) (any, error) {
+	if val == nil {
+		return nil, nil
+	}
+
+	typeLower := strings.ToLower(typ)
+	switch {
+	case strings.Contains(typeLower, "int8"):
+		return int8(val.(float64)), nil
+	case strings.Contains(typeLower, "int16"):
+		return int16(val.(float64)), nil
+	case strings.Contains(typeLower, "int32"):
+		return int32(val.(float64)), nil
+	case strings.Contains(typeLower, "int64"):
+		return int64(val.(float64)), nil
+	case strings.Contains(typeLower, "uint8"):
+		return uint8(val.(float64)), nil
+	case strings.Contains(typeLower, "uint16"):
+		return uint16(val.(float64)), nil
+	case strings.Contains(typeLower, "uint32"):
+		return uint32(val.(float64)), nil
+	case strings.Contains(typeLower, "uint64"):
+		return uint64(val.(float64)), nil
+	case strings.Contains(typeLower, "float32"):
+		return float32(val.(float64)), nil
+	case strings.Contains(typeLower, "float64"):
+		return val.(float64), nil
+	case strings.Contains(typeLower, "decimal"):
+		return val.(float64), nil
+	case strings.Contains(typeLower, "datetime"), strings.Contains(typeLower, "date"):
+		if str, ok := val.(string); ok {
+			t, err := time.Parse(time.RFC3339, str)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing time: %w", err)
+			}
+			return t, nil
+		}
+		return nil, fmt.Errorf("expected string for datetime, got %T", val)
+	case strings.Contains(typeLower, "string"):
+		return val.(string), nil
+	case strings.Contains(typeLower, "bool"):
+		return val.(bool), nil
+	default:
+		return val, nil
+	}
 }
 
 func restoreDatabase(ctx context.Context, conn clickhouse.Conn, database string, filePath string) error {
@@ -235,7 +401,17 @@ func restoreDatabase(ctx context.Context, conn clickhouse.Conn, database string,
 			}
 
 			for _, row := range table.Data {
-				if err := batch.Append(row...); err != nil {
+				// Convert values to appropriate types for insertion
+				convertedRow := make([]any, len(row))
+				for i, val := range row {
+					converted, err := convertValue(val, table.Types[i])
+					if err != nil {
+						return fmt.Errorf("error converting value for column %s: %w", table.Columns[i], err)
+					}
+					convertedRow[i] = converted
+				}
+
+				if err := batch.Append(convertedRow...); err != nil {
 					return fmt.Errorf("error inserting data into %s: %w", table.Name, err)
 				}
 			}
