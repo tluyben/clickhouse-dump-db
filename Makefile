@@ -13,7 +13,8 @@ linux-amd64:
 	GOOS=linux GOARCH=amd64 go build -o $(BINARY_NAME)-linux-amd64 main.go
 
 deploy-s3: linux-amd64
-	source .env && rclone --s3-provider Other \
+	@ls -l $(BINARY_NAME)-linux-amd64 || (echo "Binary missing right before upload!")
+	source .env && rclone -v --s3-provider Other \
 		--s3-endpoint=$$S3_ENDPOINT \
 		--s3-access-key-id=$$S3_ACCESS_KEY \
 		--s3-secret-access-key=$$S3_SECRET_KEY \

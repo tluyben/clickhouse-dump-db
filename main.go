@@ -476,8 +476,13 @@ func restoreDatabase(ctx context.Context, conn clickhouse.Conn, database string,
 
 	// Restore tables
 	for _, table := range metadata.Tables {
-		// Create table
-		createSQL := strings.Replace(table.Schema, table.Name, fmt.Sprintf("%s.%s", database, table.Name), 1)
+		// Create table - replace only the database name after "CREATE TABLE"
+		parts := strings.SplitN(table.Schema, ".", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid table schema format for table %s", table.Name)
+		}
+		createSQL := fmt.Sprintf("CREATE TABLE %s.%s", database, parts[1])
+		
 		if err := conn.Exec(ctx, createSQL); err != nil {
 			return fmt.Errorf("error creating table %s: %w", table.Name, err)
 		}
