@@ -13,3 +13,4 @@ env.local
 /Godeps/
 editor
 clickhouse-dump-db
+clickhouse-dump-db-linux-amd64
